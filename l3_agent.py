@@ -20,6 +20,8 @@
 import eventlet
 import netaddr
 from oslo.config import cfg
+import os
+import shutil
 
 from neutron.agent.common import config
 from neutron.agent.linux import external_process
@@ -183,6 +185,10 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         cfg.StrOpt('metadata_proxy_socket',
                    default='$state_path/metadata_proxy',
                    help=_('Location of Metadata Proxy UNIX domain '
+                          'socket')),
+        cfg.StrOpt('dhcp_confs',
+                   default='$state_path/dhcp',
+                   help=_('Location to store DHCP server config files'
                           'socket')),
     ]
 
@@ -385,7 +391,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
 
         for p in old_ports:
             ri.internal_ports.remove(p)
-            self.internal_network_removed(ri, p['id'], p['ip_cidr'])
+            self.internal_network_removed(ri, p['network_id'], p['id'], p['ip_cidr'])
 
         internal_cidrs = [p['ip_cidr'] for p in ri.internal_ports]
         # TODO(salv-orlando): RouterInfo would be a better place for
@@ -473,12 +479,17 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                 if (new_fixed_ip and existing_fixed_ip and
                         new_fixed_ip != existing_fixed_ip):
                     floating_ip = fip['floating_ip_address']
-                    self.floating_ip_removed(ri, ri.ex_gw_port,
-                                             floating_ip, existing_fixed_ip)
-                    self.floating_ip_added(ri, ri.ex_gw_port,
-                                           floating_ip, new_fixed_ip)
-                    ri.floating_ips.remove(fip)
-                    ri.floating_ips.append(new_fip)
+                    
+                    floating = netaddr.IPAddress(floating_ip)
+                    fixed = netaddr.IPAddress(new_fixed_ip)
+
+                    if floating.version == 4 and fixed.version == 4: 
+                        self.floating_ip_removed(ri, ri.ex_gw_port,
+                                                 floating_ip, existing_fixed_ip)
+                        self.floating_ip_added(ri, ri.ex_gw_port,
+                                               floating_ip, new_fixed_ip)
+                        ri.floating_ips.remove(fip)
+                        ri.floating_ips.append(new_fip)
 
     def _get_ex_gw_port(self, ri):
         return ri.router.get('gw_port')
@@ -520,19 +531,48 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                              prefix=EXTERNAL_DEV_PREFIX)
         self.driver.init_l3(interface_name, [ex_gw_port['ip_cidr']],
                             namespace=ri.ns_name())
-        ip_address = ex_gw_port['ip_cidr'].split('/')[0]
-        self._send_gratuitous_arp_packet(ri, interface_name, ip_address)
 
+        external_cidr = ex_gw_port['subnet']['cidr']
+        net = netaddr.IPNetwork(external_cidr)
         gw_ip = ex_gw_port['subnet']['gateway_ip']
-        if ex_gw_port['subnet']['gateway_ip']:
-            cmd = ['route', 'add', 'default', 'gw', gw_ip]
-            if self.conf.use_namespaces:
-                ip_wrapper = ip_lib.IPWrapper(self.root_helper,
-                                              namespace=ri.ns_name())
-                ip_wrapper.netns.execute(cmd, check_exit_code=False)
-            else:
-                utils.execute(cmd, check_exit_code=False,
-                              root_helper=self.root_helper)
+
+        if (net.version == 4):
+            ip_address = ex_gw_port['ip_cidr'].split('/')[0]
+            self._send_gratuitous_arp_packet(ri, interface_name, ip_address)
+            
+            if ex_gw_port['subnet']['gateway_ip']:
+                cmd = ['route', 'add', 'default', 'gw', gw_ip]
+                if self.conf.use_namespaces:
+                    ip_wrapper = ip_lib.IPWrapper(self.root_helper,
+                                                  namespace=ri.ns_name())
+                    ip_wrapper.netns.execute(cmd, check_exit_code=False)
+                else:
+                    utils.execute(cmd, check_exit_code=False,
+                                  root_helper=self.root_helper)
+        elif (net.version == 6):
+            parm_list=[]
+            parm_list += ["net.ipv6.conf.%s.accept_ra=2"%str(interface_name)]
+            parm_list += ["net.ipv6.conf.%s.forwarding=1"%str(interface_name)]
+            parm_list += ["net.ipv6.conf.%s.accept_ra_defrtr=1"%str(interface_name)]
+            for parm in parm_list:
+                cmd = ['sysctl'] + [parm]             
+                if self.conf.use_namespaces:
+                    ip_wrapper = ip_lib.IPWrapper(self.root_helper,
+                                                  namespace=ri.ns_name())
+                    ip_wrapper.netns.execute(cmd, check_exit_code=False)
+                else:
+                    utils.execute(cmd, check_exit_code=False,
+                                  root_helper=self.root_helper) 
+            #add routing table for internal ipv6 networks
+            for internal_cidr in internal_cidrs:
+                internal_net = netaddr.IPNetwork(internal_cidr)
+                if(internal_net.version == 6):
+                    cmd = ['route', 'add', internal_cidr, 'gw', gw_ip]
+                    utils.execute(cmd, check_exit_code=False,
+                                      root_helper=self.root_helper)                  
+
+        else:
+            pass 
 
     def external_gateway_removed(self, ri, ex_gw_port,
                                  interface_name, internal_cidrs):
@@ -544,6 +584,13 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                                bridge=self.conf.external_network_bridge,
                                namespace=ri.ns_name(),
                                prefix=EXTERNAL_DEV_PREFIX)
+
+        for internal_cidr in internal_cidrs:
+            internal_net = netaddr.IPNetwork(internal_cidr)
+            if(internal_net.version == 6):
+                cmd = ['route', 'del', internal_cidr]
+                utils.execute(cmd, check_exit_code=False,
+                                 root_helper=self.root_helper)                  
 
     def metadata_filter_rules(self):
         rules = []
@@ -568,12 +615,15 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                   '--ctstate DNAT -j ACCEPT' %
                   {'interface_name': interface_name})]
         for cidr in internal_cidrs:
-            rules.extend(self.internal_network_nat_rules(ex_gw_ip, cidr))
+            net = netaddr.IPNetwork(cidr)
+            if (net.version == 4):
+                rules.extend(self.internal_network_nat_rules(ex_gw_ip, cidr))
         return rules
 
     def internal_network_added(self, ri, network_id, port_id,
                                internal_cidr, mac_address):
         interface_name = self.get_internal_device_name(port_id)
+        net = netaddr.IPNetwork(internal_cidr)
         if not ip_lib.device_exists(interface_name,
                                     root_helper=self.root_helper,
                                     namespace=ri.ns_name()):
@@ -583,16 +633,120 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
 
         self.driver.init_l3(interface_name, [internal_cidr],
                             namespace=ri.ns_name())
-        ip_address = internal_cidr.split('/')[0]
-        self._send_gratuitous_arp_packet(ri, interface_name, ip_address)
+        if(net.version == 4):
+            ip_address = internal_cidr.split('/')[0]
+            self._send_gratuitous_arp_packet(ri, interface_name, ip_address)
 
-    def internal_network_removed(self, ri, port_id, internal_cidr):
-        interface_name = self.get_internal_device_name(port_id)
+        if(net.version == 6):
+            parm = "net.ipv6.conf.%s.accept_ra_defrtr=0"%str(interface_name)
+            cmd = ['sysctl'] + [parm]             
+            if self.conf.use_namespaces:
+                ip_wrapper = ip_lib.IPWrapper(self.root_helper,
+                                              namespace=ri.ns_name())
+                ip_wrapper.netns.execute(cmd, check_exit_code=False)
+            else:
+                utils.execute(cmd, check_exit_code=False,
+                              root_helper=self.root_helper)  
+            #spawn a dnsmasq process for ipv6 slaac
+            def _get_conf_file_name(network_id, kind, ensure_conf_dir=False):
+            	"""Returns the file name for a given kind of config file."""
+                confs_dir = os.path.abspath(os.path.normpath(self.conf.dhcp_confs))
+                conf_dir = os.path.join(confs_dir, network_id)
+                if ensure_conf_dir:
+                    if not os.path.isdir(conf_dir):
+                        os.makedirs(conf_dir, 0o755)
+
+                return os.path.join(conf_dir, kind)  
+
+
+            env = {
+                'NEUTRON_NETWORK_ID': network_id,
+            }    
+           
+            cmd = [
+            'dnsmasq',
+            '--no-hosts',
+            '--no-resolv',
+            '--strict-order',
+            '--bind-interfaces',
+            '--interface=%s'%str(interface_name),
+            '--except-interface=lo',
+            '--pid-file=%s'%_get_conf_file_name(
+                network_id,'ipv6pid',ensure_conf_dir=True),
+            '--leasefile-ro',
+            '--enable-ra',
+            ] 
+
+            mode = 'slaac'
+            cmd.append('--dhcp-range=%s%s,%s,%s,%ss'%
+                ('set:','tag0', net.network,
+                  mode,
+                  '120'))
+
+            cmd.append('--dhcp-range=%s%s,%s,%s,%ss'%
+                ('set:','tag1', '1.1.1.1',
+                  'static',
+                  '120'))
+            
+            if self.conf.use_namespaces:
+                ip_wrapper = ip_lib.IPWrapper(self.root_helper,
+                                              namespace=ri.ns_name())
+                ip_wrapper.netns.execute(cmd, addl_env=env)
+            else:
+                # For normal sudo prepend the env vars before command
+                cmd = ['%s=%s' % pair for pair in env.items()] + cmd
+                utils.execute(cmd, self.root_helper)
+
+    def internal_network_removed(self, ri, network_id, port_id, internal_cidr):
+        interface_name = self.get_internal_device_name(port_id)        
         if ip_lib.device_exists(interface_name,
                                 root_helper=self.root_helper,
                                 namespace=ri.ns_name()):
             self.driver.unplug(interface_name, namespace=ri.ns_name(),
                                prefix=INTERNAL_DEV_PREFIX)
+
+        net = netaddr.IPNetwork(internal_cidr)
+        if(net.version == 6):
+            cmd = ['route', 'del', internal_cidr]
+            utils.execute(cmd, check_exit_code=False,
+                          root_helper=self.root_helper)   
+
+            #kill dnsmasq process
+            
+            def _get_ipv6pid_from_conf_file(network_id):                
+                """A helper function to read a value from one of the state files."""
+                confs_dir = os.path.abspath(os.path.normpath(self.conf.dhcp_confs))
+                conf_dir = os.path.join(confs_dir, network_id)
+                file_name = os.path.join(conf_dir, 'ipv6pid')              
+                msg = _('Error while reading %s')
+
+                try:
+                    with open(file_name, 'r') as f:
+                        try:
+                            return int(f.read())
+                        except ValueError:
+                            msg = _('Unable to convert value in %s')
+                except IOError:
+                    msg = _('Unable to access %s')
+
+                LOG.debug(msg % file_name)
+                return None
+            
+            def _remove_ipv6pid_conf_file(network_id):
+		confs_dir = os.path.abspath(os.path.normpath(self.conf.dhcp_confs))
+                conf_dir = os.path.join(confs_dir, network_id)
+                file_name = os.path.join(conf_dir, 'ipv6pid')
+		shutil.rmtree(conf_dir, ignore_errors=True)
+            
+            ipv6pid = _get_ipv6pid_from_conf_file(network_id)
+            _remove_ipv6pid_conf_file(network_id)
+ 
+            if ipv6pid:
+                cmd = ['kill', '-9', str(ipv6pid)]
+                LOG.debug(_('lee cmd is %s\n'),cmd)
+                utils.execute(cmd, check_exit_code=False,
+                          root_helper=self.root_helper)   
+
 
     def internal_network_nat_rules(self, ex_gw_ip, internal_cidr):
         rules = [('snat', '-s %s -j SNAT --to-source %s' %
