@@ -535,6 +535,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         external_cidr = ex_gw_port['subnet']['cidr']
         net = netaddr.IPNetwork(external_cidr)
         gw_ip = ex_gw_port['subnet']['gateway_ip']
+        ex_gw_ip = ex_gw_port['fixed_ips'][0]['ip_address']
 
         if (net.version == 4):
             ip_address = ex_gw_port['ip_cidr'].split('/')[0]
@@ -552,7 +553,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         elif (net.version == 6):
             parm_list=[]
             parm_list += ["net.ipv6.conf.%s.accept_ra=2"%str(interface_name)]
-            parm_list += ["net.ipv6.conf.%s.forwarding=1"%str(interface_name)]
+            parm_list += ["net.ipv6.conf.all.forwarding=1"]
             parm_list += ["net.ipv6.conf.%s.accept_ra_defrtr=1"%str(interface_name)]
             for parm in parm_list:
                 cmd = ['sysctl'] + [parm]             
@@ -567,7 +568,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
             for internal_cidr in internal_cidrs:
                 internal_net = netaddr.IPNetwork(internal_cidr)
                 if(internal_net.version == 6):
-                    cmd = ['route', 'add', internal_cidr, 'gw', gw_ip]
+                    cmd = ['ip','-6', 'route', 'add', internal_cidr, 'via', ex_gw_ip]
                     utils.execute(cmd, check_exit_code=False,
                                       root_helper=self.root_helper)                  
 
@@ -577,6 +578,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
     def external_gateway_removed(self, ri, ex_gw_port,
                                  interface_name, internal_cidrs):
 
+        ex_gw_ip = ex_gw_port['fixed_ips'][0]['ip_address']
         if ip_lib.device_exists(interface_name,
                                 root_helper=self.root_helper,
                                 namespace=ri.ns_name()):
@@ -588,7 +590,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         for internal_cidr in internal_cidrs:
             internal_net = netaddr.IPNetwork(internal_cidr)
             if(internal_net.version == 6):
-                cmd = ['route', 'del', internal_cidr]
+                cmd = ['ip', '-6', 'route', 'del', internal_cidr, 'via', ex_gw_ip]
                 utils.execute(cmd, check_exit_code=False,
                                  root_helper=self.root_helper)                  
 
@@ -638,15 +640,17 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
             self._send_gratuitous_arp_packet(ri, interface_name, ip_address)
 
         if(net.version == 6):
-            parm = "net.ipv6.conf.%s.accept_ra_defrtr=0"%str(interface_name)
+            parm_list = ["net.ipv6.conf.%s.accept_ra_defrtr=0"%str(interface_name),]
+            parm_list += ["net.ipv6.conf.%s.forwarding=1"%str(interface_name),]
+            for parm in parm_list:
             cmd = ['sysctl'] + [parm]             
-            if self.conf.use_namespaces:
-                ip_wrapper = ip_lib.IPWrapper(self.root_helper,
-                                              namespace=ri.ns_name())
-                ip_wrapper.netns.execute(cmd, check_exit_code=False)
-            else:
-                utils.execute(cmd, check_exit_code=False,
-                              root_helper=self.root_helper)  
+                if self.conf.use_namespaces:
+                    ip_wrapper = ip_lib.IPWrapper(self.root_helper,
+                                                  namespace=ri.ns_name())
+                    ip_wrapper.netns.execute(cmd, check_exit_code=False)
+                else:
+                    utils.execute(cmd, check_exit_code=False,
+                                  root_helper=self.root_helper)  
             #spawn a dnsmasq process for ipv6 slaac
             def _get_conf_file_name(network_id, kind, ensure_conf_dir=False):
             	"""Returns the file name for a given kind of config file."""
@@ -697,6 +701,13 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                 cmd = ['%s=%s' % pair for pair in env.items()] + cmd
                 utils.execute(cmd, self.root_helper)
 
+            ex_gw_port = ri.ex_gw_port
+            if ex_gw_port != None:
+                ex_gw_ip = ex_gw_port['fixed_ips'][0]['ip_address']
+                cmd = ['ip','-6', 'route', 'add', internal_cidr, 'via', ex_gw_ip]
+                utils.execute(cmd, check_exit_code=False,
+                              root_helper=self.root_helper)
+
     def internal_network_removed(self, ri, network_id, port_id, internal_cidr):
         interface_name = self.get_internal_device_name(port_id)        
         if ip_lib.device_exists(interface_name,
@@ -707,9 +718,9 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
 
         net = netaddr.IPNetwork(internal_cidr)
         if(net.version == 6):
-            cmd = ['route', 'del', internal_cidr]
-            utils.execute(cmd, check_exit_code=False,
-                          root_helper=self.root_helper)   
+            #cmd = ['ip', '-6', 'route', 'del', internal_cidr]
+            #utils.execute(cmd, check_exit_code=False,
+            #              root_helper=self.root_helper)   
 
             #kill dnsmasq process
             
@@ -733,10 +744,10 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                 return None
             
             def _remove_ipv6pid_conf_file(network_id):
-		confs_dir = os.path.abspath(os.path.normpath(self.conf.dhcp_confs))
+		        confs_dir = os.path.abspath(os.path.normpath(self.conf.dhcp_confs))
                 conf_dir = os.path.join(confs_dir, network_id)
                 file_name = os.path.join(conf_dir, 'ipv6pid')
-		shutil.rmtree(conf_dir, ignore_errors=True)
+		        shutil.rmtree(conf_dir, ignore_errors=True)
             
             ipv6pid = _get_ipv6pid_from_conf_file(network_id)
             _remove_ipv6pid_conf_file(network_id)
@@ -745,7 +756,14 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                 cmd = ['kill', '-9', str(ipv6pid)]
                 LOG.debug(_('lee cmd is %s\n'),cmd)
                 utils.execute(cmd, check_exit_code=False,
-                          root_helper=self.root_helper)   
+                          root_helper=self.root_helper)  
+
+            ex_gw_port = ri.ex_gw_port
+            if ex_gw_port != None:
+                ex_gw_ip = ex_gw_port['fixed_ips'][0]['ip_address']
+                cmd = ['ip','-6', 'route', 'del', internal_cidr, 'via', ex_gw_ip]
+                utils.execute(cmd, check_exit_code=False,
+                              root_helper=self.root_helper)               
 
 
     def internal_network_nat_rules(self, ex_gw_ip, internal_cidr):
